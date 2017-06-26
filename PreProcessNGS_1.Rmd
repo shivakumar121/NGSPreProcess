@@ -1,0 +1,232 @@
+---
+title: 'Aim : Pre-process all FASTQs using GATK best-practices pipleine'
+output:
+  html_document: default
+  html_notebook: default
+---
+
+We need to take all the FastQ files and run them through our analysis pipeline. We are going to use Starcluster and BiocParallel to run FastQ files from each sample separately in-parallel to save time. The Master node will run this code and submit tasks to Slave nodes. Master will not execute any of the jobs submitted to the SGE job scheduler.
+
+## 1) Load Libraries.
+
+Start with loading all libraries required for the job.
+
+```{r}
+library ("Rmpi")
+library ("BiocParallel")
+library ("BatchJobs")
+library ("stringr")
+```
+
+## 2) Declare some important variables.
+
+Now we need to initiate some variables like program location, output directory etc.
+
+```{r}
+PathToSRAToolKit = "/home/ubuntu/NGS_Software/SRAToolKit/sratoolkit.2.5.4-1-ubuntu64/bin"
+TRIMGALORE_DIR = "/home/ubuntu/NGS_Software/TrimGalore/trim_galore_zip"
+InputFASTQDir = "/media/CryoEM_F20Data/MedGenome/MedGenome_WGS/university_of_washington"
+MedGenomeOutDir = "/media/CryoEM_F20Data/MedGenome/MedGenome_OutDir"
+FileNames = list.files (InputFASTQDir, full.names = TRUE, recursive = TRUE, pattern = ".fastq.gz$")
+SamplesDataTable = read.csv ("/media/CryoEM_F20Data/MedGenome/MedGenome_WGS/university_of_washington/university_of_washington_sample_reference_Mod.csv")
+BWA = "/home/ubuntu/NGS_Software/BWA/bwa-0.7.15/bwa"
+PICARD = "/usr/bin/picard-tools"
+GATK = "/home/ubuntu/NGS_Software/GATK/GenomeAnalysisTK.jar"
+GENOMEREF = "/media/CryoEM_F20Data/MedGenome/RefFiles/Pf3D7v90/PlasmoDB-9.0_Pfalciparum3D7_Genome.fasta"
+DBSNP= "/media/CryoEM_F20Data/MedGenome/RefFiles/Pf3D7v90/plasmodium_falciparum.vcf"
+```
+
+## 3) Function to perform TrimGalore
+
+Now we declare a function that uses TrimGalore to perform some quality filtering and make some plots that depict the overall read-quality of each FastQ file.
+
+```{r}
+TrimGaloreQC = function (SampleName, TRIMGALORE_DIR, SamplesDataTable, FileNames, MedGenomeOutDir)
+{
+  Start_Time <- Sys.time()
+  # Load required packages
+  library ("stringr")
+  barcode = SamplesDataTable$SAM.ID[grep (SamplesDataTable$NAME, pattern = SampleName)] ## Get the barcode from CSV file.
+  FilesToWorkOn = FileNames [grep (FileNames, pattern = barcode)]
+  FilesToWorkOn = sort (FilesToWorkOn)
+  TrimGalore_OutFileName <- FilesToWorkOn
+  # Remove Directory path
+  Index <- str_locate_all(TrimGalore_OutFileName, pattern = "/")
+  Index <- c(Index[[1]][length(Index[[1]])], Index[[2]][length(Index[[2]])])
+  TrimGalore_OutFileName <- str_sub (TrimGalore_OutFileName, start = 1 + Index[c(2,2)], end = nchar(TrimGalore_OutFileName))
+  ## Generate the output file name anticipated from running TrimGalore 
+  Index <- str_locate_all(TrimGalore_OutFileName, pattern = "R[1:2]")
+  Index <- as.data.frame(Index)
+  TrimGalore_OutFileName <- paste0(str_sub(TrimGalore_OutFileName, start = 1, end = Index[c(2,4)]), "_val_", c(1:2), ".fq.gz")
+  ## Check to see if the expected output file exists, and if it does, then is it atleast 75% the size of the input file.
+  if (!(file.exists(paste0(MedGenomeOutDir,"/",TrimGalore_OutFileName[1]))))
+  {
+    system (paste (TRIMGALORE_DIR, "/trim_galore --quality 28 --fastqc --gzip --length 70 --paired --path_to_cutadapt   /usr/local/bin/cutadapt ", FilesToWorkOn[1], " ", FilesToWorkOn[2], " --output_dir ", MedGenomeOutDir,sep = ""))
+  }
+  
+  else if (file.size(paste0(MedGenomeOutDir,"/",TrimGalore_OutFileName)) > 0.75*(file.size(FilesToWorkOn)))
+  {
+    system (paste (TRIMGALORE_DIR, "/trim_galore --quality 28 --fastqc --gzip --length 70 --paired --path_to_cutadapt   /usr/local/bin/cutadapt ", FilesToWorkOn[1], " ", FilesToWorkOn[2], " --output_dir ", MedGenomeOutDir,sep = ""))
+  } else
+  {
+    print (paste0("The output file exisits, and is larger than 75% the file size of the input file. Not performing the operation."))
+  }
+  
+  print (paste0("TrimGalore took ", round(difftime(Sys.time(), Start_Time, units = "hours"), digits = 2), " hrs to complete."))
+ 
+}
+```
+
+## 4) Function to align the filtered reads to reference genome.
+
+Now that the reads have been filtered to retain good quality reads we can map it onto the reference genome using "BWA mem"" aligner.
+
+```{r}
+PreProcess_BWA = function (SampleName, BWA, PICARD, GENOMEREF, MedGenomeOutDir, SamplesDataTable)
+{
+  Start_Time <- Sys.time()
+  dateNow <- Sys.Date()
+  library ("stringr")
+  barcode = SamplesDataTable$SAM.ID[grep (SamplesDataTable$NAME, pattern = SampleName)] ## Get the barcode from CSV file.
+  FileNames <- list.files(MedGenomeOutDir, pattern = "fq.gz$", full.names = T)
+  FilesToWorkOn = FileNames [grep (FileNames, pattern = barcode)]
+  FilesToWorkOn = sort (FilesToWorkOn)
+  OutPutFileName <- paste0(MedGenomeOutDir, "/", SampleName,".", barcode, ".bwa.bam")
+  if (any(!file.exists(OutPutFileName) , (file.size(OutPutFileName) < 0.75*file.size(FilesToWorkOn[1]))))
+  {
+    RunCommand = paste (BWA, " mem -t 1 -M -k 20 -w 105 -d 105 -r 1.4 -c 12000 -A 1 -B 4 -O 6 -E 1 -L 5 -U 9 -R '@RG\\tID:", barcode, "\\tCN:UW\\tDT:", dateNow, "\\tLB:", SampleName, "\\tPL:ILLUMINA\\tPU:", barcode, "\\tSM:", SampleName, "\\tDS:", FilesToWorkOn[1],"and", FilesToWorkOn[2], "' ", GENOMEREF, " ", FilesToWorkOn[1], " ", FilesToWorkOn[2], " | ", PICARD, " SamFormatConverter", " COMPRESSION_LEVEL=5 I=/dev/stdin O=" , OutPutFileName, sep = "")
+  
+  WriteOutFile = paste (MedGenomeOutDir, "/", SampleName,".", barcode, ".bwa_shell.sh", sep = "")
+  write (x= RunCommand, file = as.character (WriteOutFile))
+  system (paste ("chmod a+x ", WriteOutFile, sep = ""), wait = TRUE)
+  system (paste ("sh ", WriteOutFile, sep = ""), wait = TRUE)
+  print (paste0("BWA mem took ", round(difftime(Sys.time(), Start_Time, units = "hours"), digits = 2), " hrs to complete."))
+  }
+}
+```
+
+## 5) Function to Sort, MarkDuplicates, Realign and Recalibrate quality scores.
+
+Now that the "BWA mem" algorithm has done an initial alignment of the reads, we need to follow along the GATK best practices pipeline by doing Sorting, Mark Duplicates, then realigning followed by Recalibrationg the quality scores.
+
+```{r}
+PreProcess_SortToRecal = function (SampleName, GATK, PICARD, GENOMEREF, MedGenomeOutDir, SamplesDataTable, DBSNP)
+{
+AfterAlignStartTime = Sys.time()
+library ("stringr")
+########### Sorting ####################
+barcode = SamplesDataTable$SAM.ID[grep (SamplesDataTable$NAME, pattern = SampleName)] ## Get the barcode from CSV file.
+FileNames <- list.files(MedGenomeOutDir, pattern = "bwa.bam$", full.names = T)
+FilesToWorkOn = FileNames [grep (FileNames, pattern = barcode)]
+FilesToWorkOn = sort (FilesToWorkOn)
+print ("Doing Sorting Now")
+OutPutFile = paste (MedGenomeOutDir, "/", SampleName, ".sorted.bwa.bam", sep = "")
+if (any(!file.exists(OutPutFile) , (file.size(OutPutFile) < 0.75*file.size(FilesToWorkOn))))
+{
+  #system (paste0 (PICARD, " SortSam I=",FilesToWorkOn, " OUTPUT=", OutPutFile, " SORT_ORDER=coordinate CREATE_MD5_FILE=false CREATE_INDEX=false MAX_RECORDS_IN_RAM=500000 QUIET=false COMPRESSION_LEVEL=5 TMP_DIR=", MedGenomeOutDir, "/", SampleName, "/temp/", SampleName, "/"), intern = TRUE)
+} else
+{
+  print (paste0("File already exisits: ", OutPutFile))
+}
+############ MarkDups ##########################################
+print ("Doing MarkDups now")
+FilesToWorkOn <- OutPutFile
+OutPutFile <- paste (MedGenomeOutDir, "/", SampleName, ".markeddups.merged.sorted.bwa.bam", sep = "")
+if (any(!file.exists(OutPutFile) , (file.size(OutPutFile) < 0.75*file.size(FilesToWorkOn))))
+{
+  #system (paste0 (PICARD, " MarkDuplicates I=", FilesToWorkOn," OUTPUT=", OutPutFile," METRICS_FILE=", MedGenomeOutDir, "/", SampleName, ".duplicate_metrics.txt AS=true CREATE_MD5_FILE=false CREATE_INDEX=true OPTICAL_DUPLICATE_PIXEL_DISTANCE=100 QUIET=false PROGRAM_RECORD_ID=null TMP_DIR=", MedGenomeOutDir, "/", SampleName, "/temp/", SampleName, "/", ".merge.QUEUE.tmp REMOVE_DUPLICATES=false COMPRESSION_LEVEL=5"), intern = TRUE)
+} else
+{
+  print (paste0("File already exisits: ", OutPutFile))
+}
+if (all ((file.exists (OutPutFile)) , (file.exists (FilesToWorkOn)) , (file.size(OutPutFile) > (0.7*file.size(FilesToWorkOn)))))
+{
+  print (paste0("Removing file ", FilesToWorkOn))
+  file.remove(FilesToWorkOn)
+}
+############# InDel Cal #####################
+print ("Now IndelCal")
+FilesToWorkOn = OutPutFile
+EndIndex <- str_locate(FilesToWorkOn, pattern = "\\.")
+OutPutFile <- paste0 (str_sub (FilesToWorkOn, start = 1, end = EndIndex[1]), "merged.sorted.nodups.suspicious.indel.intervals.list")
+if (any(!file.exists(OutPutFile) , (file.size(OutPutFile) < 0.75*file.size(FilesToWorkOn))))
+{
+  #system (paste0 ("java -d64 -Xmx3G -jar ",GATK," -T RealignerTargetCreator -nt 1 -I ", FilesToWorkOn," --maxIntervalSize 500 --minReadsAtLocus 4 --mismatchFraction 0.0 --windowSize 10 -R ", GENOMEREF, " -o ", OutPutFile), intern = TRUE)
+} else
+{
+  print (paste0("File already exisits: ", OutPutFile))
+}
+#################### ReAlign ###################
+print ("Now ReAlign")
+EndIndex <- str_locate(FilesToWorkOn, pattern = "\\.")
+OutPutFile <- paste0 (str_sub(FilesToWorkOn, start = 1, end = EndIndex[1]), "realigned.markeddups.merged.sorted.bwa.bam")
+if (any(!file.exists(OutPutFile) , (file.size(OutPutFile) < 0.75*file.size(FilesToWorkOn))))
+{
+  #system (paste0 ("java -d64 -Xmx3G -jar ", GATK, " -T IndelRealigner --knownAlleles ", DBSNP, " --entropyThreshold 0.10 --maxConsensuses 30 --maxIsizeForMovement 2000 --maxPositionalMoveAllowed 175 --maxReadsForConsensuses 120 --maxReadsForRealignment 25000 --maxReadsInMemory 150000 -I ",  FilesToWorkOn, " -R ", GENOMEREF, " -targetIntervals ", MedGenomeOutDir, "/", SampleName, ".merged.sorted.nodups.suspicious.indel.intervals.list -o ", OutPutFile), intern = TRUE, ignore.stdout = FALSE, ignore.stderr = FALSE)
+} else
+{
+  print (paste0("File already exisits: ", OutPutFile))
+}
+if (all ((file.exists (OutPutFile)) , (file.exists (FilesToWorkOn)) , (file.size(OutPutFile) > (0.7*file.size(FilesToWorkOn)))))
+{
+  print (paste0("Removing file ", FilesToWorkOn))
+  file.remove(FilesToWorkOn)
+}
+############### MatrixCal And ReCal ######################################
+print ("Done with ReAling")
+print ("Now MatrixCal")
+FilesToWorkOn <- OutPutFile
+EndIndex <- str_locate(FilesToWorkOn, pattern = "\\.")
+OutPutFile <- paste0 (str_sub(FilesToWorkOn, start = 1, end = EndIndex[1]), "recal.Matrix")
+if (any(!file.exists(OutPutFile) , (file.size(OutPutFile) < 0.75*file.size(FilesToWorkOn))))
+{
+  #system (paste0 ("java -d64 -Xmx3G -jar ", GATK," -T BaseRecalibrator -nct 1 -R ", GENOMEREF, " -knownSites ", DBSNP, " -rf BadCigar -cov CycleCovariate -cov ContextCovariate --deletions_default_quality 45 --indels_context_size 3 --insertions_default_quality 45 --low_quality_tail 3 --maximum_cycle_value 500 --mismatches_context_size 2 --mismatches_default_quality -1 -I ", FilesToWorkOn," --quantizing_levels 16 --out ", OutPutFile), intern = TRUE, ignore.stdout = FALSE, ignore.stderr = FALSE)
+}
+print ("Done with MatrixCal")
+print ("Now ReCal")
+EndIndex <- str_locate(FilesToWorkOn, pattern = "\\.")
+OutPutFile <- paste0 (str_sub(FilesToWorkOn, start = 1, end = EndIndex[1]), "recal.realigned.markeddups.merged.sorted.bwa.bam")
+system (paste0 ("java -d64 -Xmx3G -jar ", GATK, " -T PrintReads -R ", GENOMEREF, " -I ", FilesToWorkOn, " -o ", OutPutFile," -BQSR ", MedGenomeOutDir, "/", SampleName, ".recal.Matrix"), intern = TRUE)
+if (all ((file.exists (OutPutFile)) , (file.exists (FilesToWorkOn)) , (file.size(OutPutFile) > (0.7*file.size(FilesToWorkOn)))))
+{
+  print (paste0("Removing file ", FilesToWorkOn))
+  file.remove(FilesToWorkOn)
+}
+print (paste0("AfterAlign took ", round(difftime(Sys.time(), AfterAlignStartTime, units = "hours"), digits = 2), " hrs to complete."))
+}
+ 
+```
+## 6) Setup the grid for computation
+
+Now that we have created all the need functions, we have to setup the SGE grid which will do all the computation
+
+```{r}
+setConfig(conf = list(fs.timeout=3000))
+setConfig (conf = list (staged.queries =TRUE))
+funs = makeClusterFunctionsSGE("/media/CryoEM_F20Data/MedGenome/R_Scripts/VerySimple.tmpl")
+param = BatchJobsParam(workers = 100, resources = list(job.delay = TRUE, fs.timeout=18000),cluster.function = funs)
+```
+
+## 7) Call all the functions
+
+Now we are ready to call all the functions to perform all the tasks in parallel.
+
+We'll start with 'TrimGalore' function.
+
+```{r}
+bplapply (SamplesDataTable$NAME, FUN = TrimGaloreQC, BPPARAM = param, TRIMGALORE_DIR = TRIMGALORE_DIR, SamplesDataTable = SamplesDataTable, FileNames = FileNames, MedGenomeOutDir = MedGenomeOutDir)
+```
+
+Now we'll call the BWA function.
+
+```{r}
+bplapply (SamplesDataTable$NAME, FUN = PreProcess_BWA, BPPARAM = param, BWA = BWA, PICARD = PICARD, GENOMEREF = GENOMEREF, MedGenomeOutDir = MedGenomeOutDir, SamplesDataTable = SamplesDataTable)
+```
+
+Now we'll call the 'After Alignment' function.
+
+```{r}
+bplapply (SamplesDataTable$NAME, FUN = PreProcess_SortToRecal, BPPARAM = param, GATK = GATK, PICARD = PICARD, GENOMEREF = GENOMEREF, MedGenomeOutDir = MedGenomeOutDir, SamplesDataTable = SamplesDataTable, DBSNP = DBSNP)
+```
+
+
